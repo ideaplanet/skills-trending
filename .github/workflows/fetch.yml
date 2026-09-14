@@ -1,0 +1,49 @@
+name: fetch
+
+on:
+  schedule:
+    # 每 6 小时抓一次:同一天内重复抓取会 UPSERT 到当日快照
+    # (update_count 递增、latest 数据刷新),跨天则生成新的 view_date 历史。
+    # 想改频率直接改 cron;分钟数避开整点以错开 GitHub 高峰。
+    - cron: '17 1,7,13,19 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: fetch-db
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+
+      # 抓取前先验证;解析坏了直接红,不污染 db。
+      - run: bun run typecheck
+      - run: bun test
+
+      - run: bun run db:migrate
+      - run: bun src/cli.ts fetch
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "bot@github.com"
+          git add data/skills.db
+          if git diff --cached --quiet; then
+            echo "::warning::data/skills.db unchanged after fetch"
+            exit 0
+          fi
+          git commit -m "chore(data): skills snapshot $(date -u +%FT%TZ)"
+          git push

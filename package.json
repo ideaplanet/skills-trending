@@ -1,0 +1,24 @@
+{
+  "name": "skills-trending",
+  "version": "0.1.0",
+  "description": "Track skills.sh trending into SQLite, commit DB back to the repo.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "fetch": "bun src/cli.ts fetch",
+    "latest": "bun src/cli.ts latest",
+    "history": "bun src/cli.ts history",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "bun src/db/migrate.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^7.0.2"
+  }
+}

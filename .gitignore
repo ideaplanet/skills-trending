@@ -1,0 +1,5 @@
+# data/skills.db 需要提交回仓库,作为跨 CI 运行的持久化存储;
+# 只忽略 WAL 副产物(closeDb 已 checkpoint,主文件包含全部数据)。
+data/*.db-*
+node_modules/
+.env
