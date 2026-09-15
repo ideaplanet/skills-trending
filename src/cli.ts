@@ -2,6 +2,7 @@
 import { runFetch } from './commands/fetch';
 import { runHistory } from './commands/history';
 import { runLatest } from './commands/latest';
+import { runDetail } from './commands/detail';
 import { VIEWS, type View } from './types';
 
 const DEFAULT_DB = 'data/skills.db';
@@ -14,6 +15,7 @@ Commands:
   fetch    Scrape skills.sh leaderboards and write to SQLite
   latest   Show the latest snapshot for a view
   history  Show one skill's leaderboard history
+  detail   Show one skill's full SKILL.md (fetch & cache on demand)
   help     Show this message
 
 Run "bun src/cli.ts <command> --help" for command-specific flags.
@@ -33,14 +35,26 @@ const flags = parseFlags(argv.slice(1));
 try {
   if (cmd === 'fetch') {
     if (flags.has('help') || flags.has('h')) {
-      console.log(`fetch [--db <path>] [--views all-time,trending,hot] [--dry-run]`);
+      console.log(
+        `fetch [--db <path>] [--views all-time,trending,hot] [--dry-run] [--with-readme [N]]` +
+          `\n  --with-readme [N]  fill SKILL.md for trending top N (default 50) skills missing a readme`,
+      );
       process.exit(0);
     }
     const views = parseViews(getStr(flags, 'views', VIEWS.join(',')));
+    const wr = flags.get('with-readme');
+    // --with-readme [N]:给 trending Top N(默认 50)中尚无缓存的技能补抓 SKILL.md
+    const withReadme =
+      wr === undefined ? 0 : wr === true ? 50 : parseInt(wr, 10);
+    if (Number.isNaN(withReadme) || withReadme < 0) {
+      console.error(`invalid --with-readme value (expected a number >= 0)`);
+      process.exit(2);
+    }
     await runFetch({
       dbPath: getStr(flags, 'db', DEFAULT_DB),
       views,
       dryRun: flags.has('dry-run'),
+      withReadme,
     });
     process.exit(0);
   }
@@ -79,6 +93,27 @@ try {
       skillQuery: skillArg,
       view,
       limit: parseInt(getStr(flags, 'limit', '30'), 10),
+      json: flags.has('json'),
+    });
+    process.exit(code);
+  }
+
+  if (cmd === 'detail') {
+    if (flags.has('help') || flags.has('h')) {
+      console.log(
+        `detail --skill <owner/repo/skillId|skillId> [--db <path>] [--refresh] [--json]`,
+      );
+      process.exit(0);
+    }
+    const skillArg = getStrOrNull(flags, 'skill');
+    if (!skillArg) {
+      console.error('detail: --skill <owner/repo/skillId|skillId> is required');
+      process.exit(2);
+    }
+    const code = await runDetail({
+      dbPath: getStr(flags, 'db', DEFAULT_DB),
+      skillQuery: skillArg,
+      refresh: flags.has('refresh'),
       json: flags.has('json'),
     });
     process.exit(code);

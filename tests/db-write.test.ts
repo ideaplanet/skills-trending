@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
 import { and, eq } from 'drizzle-orm';
 import { closeDb, openDb, type DB } from '../src/db/client';
-import { skill, skillView } from '../src/db/schema';
-import { writeBatch } from '../src/commands/fetch';
+import { skill, skillReadme, skillView } from '../src/db/schema';
+import { enrichReadmes, writeBatch } from '../src/commands/fetch';
 import type { ParsedRow, View } from '../src/types';
 
 function row(overrides: Partial<ParsedRow> = {}): ParsedRow {
@@ -241,5 +241,157 @@ describe('writeBatch — partial views do not flip is_latest', () => {
         .all();
       expect(latest.length).toBe(1);
     }
+  });
+});
+
+function upsertReadme(db: DB, pk: string, content: string, fetchedAt: number) {
+  db.insert(skillReadme)
+    .values({
+      skill_pk: pk,
+      content,
+      content_type: 'markdown',
+      fetch_source: 'github-raw',
+      source_url: `https://raw.githubusercontent.com/${pk}/SKILL.md`,
+      fetched_at: fetchedAt,
+    })
+    .onConflictDoUpdate({
+      target: skillReadme.skill_pk,
+      set: { content, fetched_at: fetchedAt },
+    })
+    .run();
+}
+
+describe('skill_readme — upsert & FK', () => {
+  test('re-fetch overwrites content, one row per skill', () => {
+    const t1 = 1_789_000_000;
+    writeBatch(db, {
+      now: t1,
+      parsed: { trending: [row()], 'all-time': [], hot: [] },
+    });
+    const pk = 'vercel-labs/skills/find-skills';
+    upsertReadme(db, pk, 'v1 content', t1);
+    upsertReadme(db, pk, 'v2 content', t1 + 60);
+
+    const rows = db.select().from(skillReadme).all();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.content).toBe('v2 content');
+    expect(rows[0]!.fetched_at).toBe(t1 + 60);
+  });
+
+  test('FK: readme for unknown skill is rejected', () => {
+    expect(() => upsertReadme(db, 'ghost/repo/nope', 'x', 1)).toThrow();
+  });
+});
+
+describe('enrichReadmes — incremental fill', () => {
+  function mockFetch(log: string[], body = '# content\n') {
+    return async (url: string | URL | Request): Promise<Response> => {
+      log.push(String(url));
+      return new Response(body, { status: 200 });
+    };
+  }
+
+  test('skips cached skills, fetches only missing ones', async () => {
+    const t1 = 1_789_000_000;
+    const top: ParsedRow[] = [
+      row({ rank: 1 }),
+      row({ pk: 'a/b/c', source: 'a/b', skill_id: 'c', rank: 2 }),
+    ];
+    writeBatch(db, { now: t1, parsed: { trending: top, 'all-time': [], hot: [] } });
+    // find-skills 已有缓存
+    upsertReadme(db, 'vercel-labs/skills/find-skills', 'cached', t1);
+
+    const urls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch(urls) as unknown as typeof fetch;
+    try {
+      await enrichReadmes(db, top, 50, t1 + 60);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // 只请求了 a/b/c 的 github raw,find-skills 未重复下载
+    expect(urls).toEqual([
+      'https://raw.githubusercontent.com/a/b/HEAD/skills/c/SKILL.md',
+    ]);
+    const rows = db.select().from(skillReadme).all();
+    expect(rows.length).toBe(2);
+    expect(rows.find((r) => r.skill_pk === 'a/b/c')!.content).toBe('# content\n');
+  });
+
+  test('all cached → zero network calls', async () => {
+    const t1 = 1_789_000_000;
+    const top: ParsedRow[] = [
+      row({ rank: 1 }),
+      row({ pk: 'a/b/c', source: 'a/b', skill_id: 'c', rank: 2 }),
+    ];
+    writeBatch(db, { now: t1, parsed: { trending: top, 'all-time': [], hot: [] } });
+    upsertReadme(db, 'vercel-labs/skills/find-skills', 'cached', t1);
+    upsertReadme(db, 'a/b/c', 'cached', t1);
+
+    const urls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch(urls) as unknown as typeof fetch;
+    try {
+      await enrichReadmes(db, top, 50, t1 + 60);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    expect(urls).toEqual([]);
+    expect(db.select().from(skillReadme).all().length).toBe(2);
+  });
+
+  test('failed fetch is recorded as empty-content marker and skipped on next run', async () => {
+    const t1 = 1_789_000_000;
+    const top: ParsedRow[] = [
+      row({ pk: 'a/b/c', source: 'a/b', skill_id: 'c', rank: 1 }),
+    ];
+    writeBatch(db, { now: t1, parsed: { trending: top, 'all-time': [], hot: [] } });
+
+    // 第一轮:两条路都 404 → 写入空内容标记行
+    const urls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request): Promise<Response> => {
+      urls.push(String(url));
+      return new Response('404: Not Found', { status: 404 });
+    }) as unknown as typeof fetch;
+    try {
+      await enrichReadmes(db, top, 50, t1);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    expect(urls.length).toBe(2); // github raw + skills.sh 详情页各一次
+    const markers = db.select().from(skillReadme).all();
+    expect(markers.length).toBe(1);
+    expect(markers[0]!.skill_pk).toBe('a/b/c');
+    expect(markers[0]!.content).toBe('');
+    expect(markers[0]!.fetch_source).toBe('unavailable');
+    expect(markers[0]!.fetched_at).toBe(t1);
+
+    // 第二轮(冷却期内):零网络请求
+    const urls2: string[] = [];
+    globalThis.fetch = mockFetch(urls2) as unknown as typeof fetch;
+    try {
+      await enrichReadmes(db, top, 50, t1 + 3600);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    expect(urls2).toEqual([]);
+    // 标记行仍在,不会被误判为已缓存的真实内容
+    expect(db.select().from(skillReadme).all().length).toBe(1);
+
+    // 第三轮(冷却期 7 天已过):重新尝试,这次成功 → 标记行被真实内容覆盖
+    const urls3: string[] = [];
+    globalThis.fetch = mockFetch(urls3) as unknown as typeof fetch;
+    try {
+      await enrichReadmes(db, top, 50, t1 + 8 * 24 * 3600);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    expect(urls3.length).toBe(1); // github raw 直接命中
+    const final = db.select().from(skillReadme).all();
+    expect(final.length).toBe(1);
+    expect(final[0]!.content).toBe('# content\n');
+    expect(final[0]!.fetch_source).toBe('github-raw');
   });
 });

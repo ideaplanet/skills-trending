@@ -7,6 +7,11 @@ on:
     # 想改频率直接改 cron;分钟数避开整点以错开 GitHub 高峰。
     - cron: '17 1,7,13,19 * * *'
   workflow_dispatch:
+    inputs:
+      readme_top:
+        description: 'trending Top N 中补抓缺失 SKILL.md 的范围'
+        required: false
+        default: '50'
 
 concurrency:
   group: fetch-db
@@ -14,6 +19,10 @@ concurrency:
 
 permissions:
   contents: write
+
+# 手动触发可用 inputs.readme_top 覆盖;定时触发回落到默认 50。
+env:
+  README_TOP: ${{ github.event_name == 'workflow_dispatch' && inputs.readme_top || '50' }}
 
 jobs:
   fetch:
@@ -34,7 +43,9 @@ jobs:
       - run: bun test
 
       - run: bun run db:migrate
-      - run: bun src/cli.ts fetch
+      # 给 trending Top $README_TOP 中尚无缓存的技能补抓 SKILL.md
+      # (github raw 优先、详情页回退;已有缓存的不重复下载)
+      - run: bun src/cli.ts fetch --with-readme "$README_TOP"
 
       - name: Commit & push if changed
         run: |

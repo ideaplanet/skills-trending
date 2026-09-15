@@ -64,8 +64,32 @@ export const skillView = sqliteTable(
   }),
 );
 
+/**
+ * SKILL.md 全文表:每个技能一行。
+ * github-raw 来源存原始 markdown(含 frontmatter);
+ * skills-sh 来源(非标准布局仓库的回退)存渲染后 HTML。
+ * content 为空串 = 抓取失败的标记行:fetched_at 即上次尝试时间,
+ * 冷却期内跳过该技能,成功后会被真实内容覆盖。
+ */
+export const skillReadme = sqliteTable('skill_readme', {
+  skill_pk: text('skill_pk')
+    .primaryKey()
+    .references(() => skill.pk),
+  content: text('content').notNull(),
+  content_type: text('content_type', {
+    enum: ['markdown', 'html', 'none'],
+  }).notNull(),
+  fetch_source: text('fetch_source', {
+    enum: ['github-raw', 'skills-sh', 'unavailable'],
+  }).notNull(),
+  source_url: text('source_url').notNull(),
+  fetched_at: integer('fetched_at').notNull(),
+});
+
 // 类型导出供其他模块使用
 export type Skill = typeof skill.$inferSelect;
 export type NewSkill = typeof skill.$inferInsert;
 export type SkillView = typeof skillView.$inferSelect;
 export type NewSkillView = typeof skillView.$inferInsert;
+export type SkillReadme = typeof skillReadme.$inferSelect;
+export type NewSkillReadme = typeof skillReadme.$inferInsert;

@@ -2,7 +2,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { and, eq, sql } from 'drizzle-orm';
 import { closeDb, openDb, type DB } from '../db/client';
-import { skill, skillView } from '../db/schema';
+import { skill, skillReadme, skillView } from '../db/schema';
+import { scrapeSkillReadme } from '../scrape/readme';
 import { scrapeView } from '../scrape/skills';
 import { type ParsedRow, type View, VIEWS } from '../types';
 
@@ -105,9 +106,11 @@ export interface RunFetchOptions {
   dbPath: string;
   views: View[];
   dryRun: boolean;
+  /** >0 时额外抓取 trending 榜 Top N 的完整 SKILL.md 到 skill_readme 表 */
+  withReadme?: number;
 }
 
-/** 一次完整 fetch 流程:scrape × N → writeBatch(若非 dry-run) */
+/** 一次完整 fetch 流程:scrape × N → writeBatch(若非 dry-run) → 可选补抓 SKILL.md */
 export async function runFetch(opts: RunFetchOptions): Promise<void> {
   const { dbPath, views, dryRun } = opts;
   const now = Math.floor(Date.now() / 1000);
@@ -143,10 +146,117 @@ export async function runFetch(opts: RunFetchOptions): Promise<void> {
   const db = openDb(dbPath);
   try {
     writeBatch(db, { now, parsed });
+    if (opts.withReadme && opts.withReadme > 0) {
+      await enrichReadmes(db, parsed.trending, opts.withReadme, now);
+    }
   } finally {
     closeDb(db);
   }
 
   const total = views.reduce((s, v) => s + parsed[v].length, 0);
   console.log(`→ wrote ${total} skill_view rows to ${dbPath}`);
+}
+
+/** 抓取失败后的冷却期:冷却期内不再重试,过后允许再试一次(技能可能后来变得可获取) */
+const MISS_RETRY_AFTER_SEC = 7 * 24 * 3600;
+
+/**
+ * 给 trending Top N 补抓完整 SKILL.md(github raw 优先、详情页回退),
+ * 只处理尚无缓存的技能(增量填充,CI 每次运行不必重复下载):
+ *   - 已有缓存(content 非空)的跳过;
+ *   - 抓取失败过的在 skill_readme 里留空内容标记行,冷却期内跳过;
+ *   - 成功后标记行被真实内容覆盖。
+ * 单条失败只告警,不中断整体流程。
+ * 需要刷新单个技能的缓存用 `detail --skill <pk> --refresh`。
+ */
+export async function enrichReadmes(
+  db: DB,
+  trending: ParsedRow[],
+  topN: number,
+  now: number,
+): Promise<void> {
+  const targets = trending.slice(0, topN);
+  // pk → { content, fetched_at };content 为空串即"上次抓取失败"的标记行
+  const stored = new Map(
+    db
+      .select({
+        pk: skillReadme.skill_pk,
+        content: skillReadme.content,
+        at: skillReadme.fetched_at,
+      })
+      .from(skillReadme)
+      .all()
+      .map((r) => [r.pk, r]),
+  );
+
+  let cachedCount = 0;
+  let cooldown = 0;
+  const pending: ParsedRow[] = [];
+  for (const r of targets) {
+    const s = stored.get(r.pk);
+    if (s && s.content !== '') {
+      cachedCount++;
+      continue;
+    }
+    if (s && now - s.at < MISS_RETRY_AFTER_SEC) {
+      cooldown++;
+      continue;
+    }
+    pending.push(r);
+  }
+  if (pending.length === 0) {
+    console.log(
+      `✓ readme    0 pending, ${cachedCount} cached, ${cooldown} in cooldown (top ${targets.length})`,
+    );
+    return;
+  }
+
+  let ok = 0;
+  let failed = 0;
+  for (let i = 0; i < pending.length; i++) {
+    const r = pending[i]!;
+    if (i > 0) await new Promise((res) => setTimeout(res, 400));
+    let readme: Awaited<ReturnType<typeof scrapeSkillReadme>>;
+    try {
+      readme = await scrapeSkillReadme(r.source, r.skill_id);
+    } catch (e) {
+      readme = null;
+      console.warn(`  ⚠ readme failed: ${r.pk} (${e instanceof Error ? e.message : e})`);
+    }
+    if (readme === null) {
+      failed++;
+      upsertReadme(db, {
+        skill_pk: r.pk,
+        content: '',
+        content_type: 'none',
+        fetch_source: 'unavailable',
+        source_url: `https://raw.githubusercontent.com/${r.source}/HEAD/skills/${r.skill_id}/SKILL.md`,
+        fetched_at: now,
+      });
+      console.warn(
+        `  ⚠ readme unavailable: ${r.pk} (retry after ${MISS_RETRY_AFTER_SEC / 86400}d)`,
+      );
+      continue;
+    }
+    upsertReadme(db, {
+      skill_pk: r.pk,
+      content: readme.content,
+      content_type: readme.content_type,
+      fetch_source: readme.fetch_source,
+      source_url: readme.source_url,
+      fetched_at: now,
+    });
+    ok++;
+  }
+  console.log(
+    `✓ readme    ${ok} fetched, ${failed} failed (recorded), ` +
+      `${cachedCount} cached, ${cooldown} in cooldown (top ${targets.length})`,
+  );
+}
+
+function upsertReadme(db: DB, v: typeof skillReadme.$inferInsert): void {
+  db.insert(skillReadme)
+    .values(v)
+    .onConflictDoUpdate({ target: skillReadme.skill_pk, set: v })
+    .run();
 }

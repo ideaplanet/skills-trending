@@ -8,6 +8,13 @@
       "when": 1789398958352,
       "tag": "0000_free_gwen_stacy",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1789415749740,
+      "tag": "0001_kind_radioactive_man",
+      "breakpoints": true
     }
   ]
 }
